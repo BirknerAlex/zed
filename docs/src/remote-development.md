@@ -172,6 +172,27 @@ These ports also default to the `localhost` interface on the remote host. If you
 }
 ```
 
+## SSH agent forwarding
+
+To use the SSH keys from your local SSH agent on the remote server (for example, to `git push` from the Git panel or a terminal), enable `ssh_auth_sock_forwarding`:
+
+```json [settings]
+{
+  "ssh_connections": [
+    {
+      "host": "192.168.1.10",
+      "ssh_auth_sock_forwarding": true
+    }
+  ]
+}
+```
+
+This forwards the agent at your local `SSH_AUTH_SOCK` using ssh's `ForwardAgent` option, so the SSH server must allow agent forwarding (`AllowAgentForwarding`). An `IdentityAgent` in your SSH config is still used to authenticate the connection itself, but is not what gets forwarded. On the remote, Zed points `SSH_AUTH_SOCK` at a stable path that is updated on every reconnect, so terminals and Git keep working after the connection drops.
+
+When this setting is enabled, Zed always opens its own SSH connection instead of reusing an existing `ControlMaster` session, because that session may have been opened without agent forwarding.
+
+Only enable this for hosts you trust: anyone with root access on the remote can use your forwarded agent while you are connected.
+
 ## Zed settings
 
 When opening a remote project there are three relevant settings locations:

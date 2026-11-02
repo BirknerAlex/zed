@@ -85,6 +85,8 @@ pub enum Commands {
         reconnect: bool,
         #[arg(long)]
         identifier: String,
+        #[arg(long)]
+        forward_auth_sock: bool,
     },
     Version,
     #[cfg(unix)]
@@ -112,7 +114,9 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Proxy {
             identifier,
             reconnect,
-        } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
+            forward_auth_sock,
+        } => execute_proxy(identifier, reconnect, forward_auth_sock)
+            .context("running proxy on the remote server"),
         #[cfg(unix)]
         Commands::Exec => execute_command(),
         Commands::Version => {
@@ -872,6 +876,7 @@ struct ServerPaths {
     stdin_socket: PathBuf,
     stdout_socket: PathBuf,
     stderr_socket: PathBuf,
+    ssh_auth_sock_link: PathBuf,
 }
 
 impl ServerPaths {
@@ -893,6 +898,7 @@ impl ServerPaths {
         let stdin_socket = server_dir.join("stdin.sock");
         let stdout_socket = server_dir.join("stdout.sock");
         let stderr_socket = server_dir.join("stderr.sock");
+        let ssh_auth_sock_link = server_dir.join("ssh-auth.sock");
         let log_file = logs_dir().join(format!("server-{}.log", identifier));
 
         Ok(Self {
@@ -900,6 +906,7 @@ impl ServerPaths {
             stdin_socket,
             stdout_socket,
             stderr_socket,
+            ssh_auth_sock_link,
             log_file,
         })
     }
@@ -948,6 +955,7 @@ impl ExecuteProxyError {
 pub(crate) fn execute_proxy(
     identifier: String,
     is_reconnecting: bool,
+    forward_auth_sock: bool,
 ) -> Result<(), ExecuteProxyError> {
     init_logging_proxy();
 
@@ -977,6 +985,21 @@ pub(crate) fn execute_proxy(
         .detach();
     };
     log::info!("starting proxy process. PID: {}", std::process::id());
+
+    // The server outlives the SSH session that spawned it, so it cannot use this session's
+    // `SSH_AUTH_SOCK` directly: the path changes on every reconnect. Instead the server is
+    // pointed at a stable symlink that every proxy re-targets to its own forwarded agent.
+    let ssh_auth_sock_link = if forward_auth_sock {
+        update_ssh_auth_sock_link(
+            &server_paths.ssh_auth_sock_link,
+            std::env::var_os("SSH_AUTH_SOCK"),
+        )
+        .log_err()
+        .flatten()
+    } else {
+        None
+    };
+
     let server_pid = {
         let server_pid = check_pid_file(&server_paths.pid_file).map_err(|source| {
             ExecuteProxyError::CheckPidFile {
@@ -1002,7 +1025,8 @@ pub(crate) fn execute_proxy(
                 );
                 kill_running_server(pid, &server_paths)?;
             }
-            gpui::block_on(spawn_server(&server_paths)).map_err(ExecuteProxyError::SpawnServer)?;
+            gpui::block_on(spawn_server(&server_paths, ssh_auth_sock_link.as_deref()))
+                .map_err(ExecuteProxyError::SpawnServer)?;
             std::fs::read_to_string(&server_paths.pid_file)
                 .and_then(|contents| {
                     contents.parse::<u32>().map_err(|_| {
@@ -1093,6 +1117,52 @@ pub(crate) fn execute_proxy(
     Ok(())
 }
 
+#[cfg(unix)]
+fn update_ssh_auth_sock_link(
+    link: &Path,
+    agent_socket: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    let Some(agent_socket) = agent_socket.filter(|value| !value.is_empty()) else {
+        log::warn!(
+            "SSH agent forwarding was requested, but SSH_AUTH_SOCK is not set in the SSH session"
+        );
+        return Ok(None);
+    };
+    let agent_socket = PathBuf::from(agent_socket);
+    if agent_socket == link {
+        return Ok(Some(link.to_path_buf()));
+    }
+
+    // Replace the link atomically so that processes in the running server never observe
+    // a missing socket while it is being re-targeted.
+    let temporary_link = link.with_extension(format!("sock.{}", std::process::id()));
+    std::fs::remove_file(&temporary_link).ok();
+    std::os::unix::fs::symlink(&agent_socket, &temporary_link).with_context(|| {
+        format!(
+            "creating SSH agent symlink {} -> {}",
+            temporary_link.display(),
+            agent_socket.display()
+        )
+    })?;
+    std::fs::rename(&temporary_link, link)
+        .with_context(|| format!("moving SSH agent symlink into place at {}", link.display()))?;
+    log::info!(
+        "forwarding SSH agent {} via {}",
+        agent_socket.display(),
+        link.display()
+    );
+    Ok(Some(link.to_path_buf()))
+}
+
+#[cfg(windows)]
+fn update_ssh_auth_sock_link(
+    _link: &Path,
+    _agent_socket: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    log::warn!("SSH agent forwarding is not supported on Windows remotes");
+    Ok(None)
+}
+
 fn kill_running_server(pid: u32, paths: &ServerPaths) -> Result<(), ExecuteProxyError> {
     log::info!("killing existing server with PID {}", pid);
     let system = sysinfo::System::new_with_specifics(
@@ -1140,7 +1210,10 @@ pub enum SpawnServerError {
     Timeout,
 }
 
-async fn spawn_server(paths: &ServerPaths) -> Result<(), SpawnServerError> {
+async fn spawn_server(
+    paths: &ServerPaths,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<(), SpawnServerError> {
     log::info!("spawning server process",);
     if paths.stdin_socket.exists() {
         std::fs::remove_file(&paths.stdin_socket).map_err(SpawnServerError::RemoveStdinSocket)?;
@@ -1156,12 +1229,12 @@ async fn spawn_server(paths: &ServerPaths) -> Result<(), SpawnServerError> {
 
     #[cfg(windows)]
     {
-        spawn_server_windows(&binary_name, paths)?;
+        spawn_server_windows(&binary_name, paths, ssh_auth_sock)?;
     }
 
     #[cfg(not(windows))]
     {
-        spawn_server_normal(&binary_name, paths)?;
+        spawn_server_normal(&binary_name, paths, ssh_auth_sock)?;
     }
 
     let mut total_time_waited = std::time::Duration::from_secs(0);
@@ -1187,12 +1260,20 @@ async fn spawn_server(paths: &ServerPaths) -> Result<(), SpawnServerError> {
 }
 
 #[cfg(windows)]
-fn spawn_server_windows(binary_name: &Path, paths: &ServerPaths) -> Result<(), SpawnServerError> {
+fn spawn_server_windows(
+    binary_name: &Path,
+    paths: &ServerPaths,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<(), SpawnServerError> {
     use smol::process::windows::CommandExt;
     // Detach from the console and break away from sshd's job so closing the SSH session doesn't kill the daemon.
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    smol::process::Command::new(binary_name)
+    let mut server_process = smol::process::Command::new(binary_name);
+    if let Some(ssh_auth_sock) = ssh_auth_sock {
+        server_process.env("SSH_AUTH_SOCK", ssh_auth_sock);
+    }
+    server_process
         .stdin(util::command::Stdio::null())
         .stdout(util::command::Stdio::null())
         .stderr(util::command::Stdio::null())
@@ -1214,8 +1295,15 @@ fn spawn_server_windows(binary_name: &Path, paths: &ServerPaths) -> Result<(), S
 }
 
 #[cfg(not(windows))]
-fn spawn_server_normal(binary_name: &Path, paths: &ServerPaths) -> Result<(), SpawnServerError> {
+fn spawn_server_normal(
+    binary_name: &Path,
+    paths: &ServerPaths,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<(), SpawnServerError> {
     let mut server_process = new_command(binary_name);
+    if let Some(ssh_auth_sock) = ssh_auth_sock {
+        server_process.env("SSH_AUTH_SOCK", ssh_auth_sock);
+    }
     server_process
         .stdin(util::command::Stdio::null())
         .stdout(util::command::Stdio::null())
@@ -1489,6 +1577,34 @@ mod tests {
         use super::*;
         use gpui::TestAppContext;
         use proto::EnvelopedMessage as _;
+
+        #[test]
+        fn ssh_auth_sock_link_follows_latest_agent_socket() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let link = directory.path().join("ssh-auth.sock");
+            let first_socket = directory.path().join("agent.1");
+            let second_socket = directory.path().join("agent.2");
+
+            assert_eq!(update_ssh_auth_sock_link(&link, None)?, None);
+            assert!(std::fs::symlink_metadata(&link).is_err());
+
+            assert_eq!(
+                update_ssh_auth_sock_link(&link, Some(first_socket.clone().into()))?,
+                Some(link.clone())
+            );
+            assert_eq!(std::fs::read_link(&link)?, first_socket);
+
+            assert_eq!(
+                update_ssh_auth_sock_link(&link, Some(second_socket.clone().into()))?,
+                Some(link.clone())
+            );
+            assert_eq!(std::fs::read_link(&link)?, second_socket);
+
+            // A session without a forwarded agent keeps the last working target.
+            assert_eq!(update_ssh_auth_sock_link(&link, Some("".into()))?, None);
+            assert_eq!(std::fs::read_link(&link)?, second_socket);
+            Ok(())
+        }
 
         // Windows did not reproduce socket backpressure.
         #[gpui::test]

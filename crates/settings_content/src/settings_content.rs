@@ -1444,6 +1444,11 @@ pub struct SshConnection {
     // and then upload it over the SSH connection. Useful if your SSH server has
     // limited outbound internet access.
     pub upload_binary_over_ssh: Option<bool>,
+    /// Whether to forward the local SSH agent (`SSH_AUTH_SOCK`) to the remote host,
+    /// so that git and terminals on the remote can authenticate with local keys.
+    ///
+    /// Default: false
+    pub ssh_auth_sock_forwarding: Option<bool>,
 
     pub port_forwards: Option<Vec<SshPortForwardOption>>,
     /// Timeout in seconds for SSH connection and downloading the remote server binary.

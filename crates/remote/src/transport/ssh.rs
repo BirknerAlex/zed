@@ -153,6 +153,7 @@ pub struct SshConnectionOptions {
 
     pub nickname: Option<String>,
     pub upload_binary_over_ssh: bool,
+    pub ssh_auth_sock_forwarding: bool,
 }
 
 impl From<settings_content::SshConnection> for SshConnectionOptions {
@@ -165,6 +166,7 @@ impl From<settings_content::SshConnection> for SshConnectionOptions {
             args: Some(val.args),
             nickname: val.nickname,
             upload_binary_over_ssh: val.upload_binary_over_ssh.unwrap_or_default(),
+            ssh_auth_sock_forwarding: val.ssh_auth_sock_forwarding.unwrap_or_default(),
             port_forwards: val.port_forwards,
             connection_timeout: val.connection_timeout,
         }
@@ -677,6 +679,9 @@ impl RemoteConnection for SshRemoteConnection {
             if reconnect {
                 proxy_args.push("--reconnect".to_owned());
             }
+            if self.socket.connection_options.ssh_auth_sock_forwarding {
+                proxy_args.push("--forward-auth-sock".to_owned());
+            }
             self.socket
                 .ssh_command(self.ssh_shell_kind, "env", &proxy_args, false)
         };
@@ -726,6 +731,13 @@ impl RemoteConnection for SshRemoteConnection {
 async fn find_existing_control_master(
     connection_options: &SshConnectionOptions,
 ) -> Option<PathBuf> {
+    // A multiplexed session only forwards the agent if its master was started with agent
+    // forwarding, which we cannot verify for a master the user started themselves.
+    if connection_options.ssh_auth_sock_forwarding {
+        log::debug!("SSH agent forwarding is enabled, skipping ControlMaster reuse");
+        return None;
+    }
+
     let additional_args = connection_options.additional_args();
     let destination_args = connection_options.ssh_destination_args();
     // Use `ssh -G` to resolve the user's effective SSH config for this host.
@@ -1976,6 +1988,7 @@ impl SshConnectionOptions {
             password: None,
             nickname: None,
             upload_binary_over_ssh: false,
+            ssh_auth_sock_forwarding: false,
             connection_timeout: None,
         })
     }
@@ -2004,6 +2017,15 @@ impl SshConnectionOptions {
 
         if let Some(timeout) = self.connection_timeout {
             args.extend(["-o".to_string(), format!("ConnectTimeout={}", timeout)]);
+        }
+
+        // Requested on every invocation because a multiplexed session only forwards the
+        // agent when both the master connection and the session itself ask for it.
+        if self.ssh_auth_sock_forwarding {
+            args.extend([
+                "-o".to_string(),
+                forward_agent_option(std::env::var("SSH_AUTH_SOCK").ok().as_deref()),
+            ]);
         }
 
         if let Some(port) = self.port {
@@ -2055,6 +2077,17 @@ impl SshConnectionOptions {
         } else {
             host
         }
+    }
+}
+
+/// Forwards the agent at `SSH_AUTH_SOCK` by path, because `ForwardAgent=yes` forwards the
+/// agent configured via `IdentityAgent` instead, when the user's ssh config sets one.
+fn forward_agent_option(ssh_auth_sock: Option<&str>) -> String {
+    match ssh_auth_sock {
+        Some(path) if !path.is_empty() && !path.contains('"') => {
+            format!("ForwardAgent=\"{path}\"")
+        }
+        _ => "ForwardAgent=yes".to_string(),
     }
 }
 
@@ -2974,6 +3007,38 @@ mod tests {
             ),
             "put \"C:\\\\Users\\\\Smit\\\\Zed Repro\\\\remote_server\" \".zed_server/remote_server\"\n"
         );
+    }
+
+    #[test]
+    fn ssh_args_forward_agent_only_when_enabled() {
+        let has_forward_agent = |args: Vec<String>| {
+            args.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1].starts_with("ForwardAgent="))
+        };
+        let mut options = SshConnectionOptions {
+            host: "example.com".into(),
+            ..Default::default()
+        };
+        assert!(!has_forward_agent(options.additional_args()));
+
+        options.ssh_auth_sock_forwarding = true;
+        assert!(has_forward_agent(options.additional_args()));
+        assert!(!has_forward_agent(options.additional_args_for_scp()));
+    }
+
+    #[test]
+    fn forward_agent_option_uses_ssh_auth_sock_path() {
+        assert_eq!(
+            forward_agent_option(Some("/var/run/com.apple.launchd.abc/Listeners")),
+            "ForwardAgent=\"/var/run/com.apple.launchd.abc/Listeners\""
+        );
+        assert_eq!(
+            forward_agent_option(Some("/Users/me/Library/Group Containers/agent.sock")),
+            "ForwardAgent=\"/Users/me/Library/Group Containers/agent.sock\""
+        );
+        assert_eq!(forward_agent_option(None), "ForwardAgent=yes");
+        assert_eq!(forward_agent_option(Some("")), "ForwardAgent=yes");
+        assert_eq!(forward_agent_option(Some("/tmp/a\"b")), "ForwardAgent=yes");
     }
 
     #[test]

@@ -47,6 +47,8 @@ impl RemoteSettings {
             if conn.host == host && conn.username == options.username && conn.port == options.port {
                 options.nickname = conn.nickname;
                 options.upload_binary_over_ssh = conn.upload_binary_over_ssh.unwrap_or_default();
+                options.ssh_auth_sock_forwarding =
+                    conn.ssh_auth_sock_forwarding.unwrap_or_default();
                 options.args = Some(conn.args);
                 options.port_forwards = conn.port_forwards;
                 break;

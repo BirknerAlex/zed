@@ -2138,6 +2138,9 @@ impl RemoteServerProjects {
                     nickname: None,
                     args: connection_options.args.unwrap_or_default(),
                     upload_binary_over_ssh: None,
+                    ssh_auth_sock_forwarding: connection_options
+                        .ssh_auth_sock_forwarding
+                        .then_some(true),
                     port_forwards: connection_options.port_forwards,
                     connection_timeout: connection_options.connection_timeout,
                 })
